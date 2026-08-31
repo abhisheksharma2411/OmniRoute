@@ -360,20 +360,48 @@ export function releaseStickyPinOnFailure(
 /**
  * Clear persisted LKGP pins when a target fails or is skipped due to
  * exhaustion, cooldown, or unavailability (#11911 #919).
+ *
+ * The target-scoped pin (`executionKey`) is always cleared — it is unambiguously
+ * about the target that just failed. The combo-level pin is only cleared when it
+ * actually names that target's provider: it records whichever provider last
+ * succeeded, which need not be the one failing now. Under `auto` the pin is a
+ * scoring input rather than a hoist (`resolveAutoStrategy` reads it into
+ * `lastKnownGoodProvider`), so the pinned provider is not necessarily tried first,
+ * and clearing unconditionally discarded a preference for a healthy provider every
+ * time an unrelated target was skipped.
+ *
+ * `failed` omitted keeps the previous unconditional behaviour, so callers without
+ * a target in scope are unaffected.
  */
 export function clearStaleLKGP(
   comboName: string,
   executionKey?: string | null,
   comboId?: string | null,
   log?: { warn?: (tag: string, msg: string, data?: unknown) => void } | null,
-  tag: string = "COMBO"
+  tag: string = "COMBO",
+  failed?: { provider?: string | null; connectionId?: string | null } | null
 ): void {
   void (async () => {
     try {
-      const { clearLKGP } = await import("@/lib/db/settings");
-      const promises: Promise<void>[] = [clearLKGP(comboName, comboId || comboName)];
+      const { clearLKGP, getLKGP } = await import("@/lib/db/settings");
+      const promises: Promise<void>[] = [];
       if (executionKey) {
         promises.push(clearLKGP(comboName, executionKey));
+      }
+
+      const comboKey = comboId || comboName;
+      if (!failed?.provider) {
+        promises.push(clearLKGP(comboName, comboKey));
+      } else {
+        const pin = await getLKGP(comboName, comboKey);
+        // Same provider, and — when both sides carry one — the same connection. A
+        // sibling connection failing does not make the pinned one stale.
+        const namesFailedTarget =
+          pin?.provider === failed.provider &&
+          (!pin?.connectionId || !failed.connectionId || pin.connectionId === failed.connectionId);
+        if (namesFailedTarget) {
+          promises.push(clearLKGP(comboName, comboKey));
+        }
       }
       await Promise.all(promises);
     } catch (err) {
@@ -1231,7 +1259,7 @@ async function handleComboChatInner({
           strategy === "priority" && target.fallbackOnlyOnQuotaExhaustion === true;
         const stopProtectedPriorityTarget = (message: string) => {
           observeFailure(false, target.executionKey);
-          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
           return protectedPriorityTarget
             ? { ok: false, response: errorResponse(503, message) }
             : null;
@@ -1293,7 +1321,7 @@ async function handleComboChatInner({
           );
           if (persistedSkip) {
             log.info("COMBO", persistedSkip);
-            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
             if (i > 0) fallbackCount++;
             return null;
           }
@@ -1352,7 +1380,7 @@ async function handleComboChatInner({
               "COMBO",
               `Skipping ${modelStr} — quota exhaustion cutoff (${quotaCutoff.reason || "quota_exhausted"})`
             );
-            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
             recordComboDecision(traceInvocationId, {
               step: target.executionKey,
               target: modelStr,
@@ -1390,7 +1418,7 @@ async function handleComboChatInner({
               "COMBO",
               `Skipping ${modelStr} — quota budget ${quotaDecision.reason} (remaining ${quotaDecision.tokensRemaining ?? 0}, cost ${quotaDecision.estimatedCost ?? 0})`
             );
-            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
             if (i > 0) fallbackCount++;
             return null;
           }
@@ -1408,7 +1436,7 @@ async function handleComboChatInner({
               "COMBO",
               `Skipping ${modelStr} — no credentials available or model excluded`
             );
-            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
             recordComboDecision(traceInvocationId, {
               step: target.executionKey,
               target: modelStr,
@@ -2220,7 +2248,7 @@ async function handleComboChatInner({
             exhaustedConnections.has(`${provider}:${targetWithConnection.connectionId}`) ||
             (provider && exhaustedProviders.has(provider))
           ) {
-            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
           }
 
           // #2101: Prevent infinite fallback loops with 400 Bad Request errors that are genuinely
@@ -2268,7 +2296,7 @@ async function handleComboChatInner({
             lastStatus = result.status;
             if (i > 0) fallbackCount++;
             log.warn("COMBO", `Model ${modelStr} failed with body-specific error, stopping combo`);
-            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
             // #4279: surface the 400 via the {ok,response} contract so the OUTER
             // target loop resolves the combo and stops. A bare `break` here only
             // exits the inner retry loop; executeTarget then returns null, which
@@ -2457,7 +2485,7 @@ async function handleComboChatInner({
           // *next* separate request. Circuit breaker / model lockout deliberately
           // don't react to request-scoped failure classes (see scopedFailure below),
           // so nothing else clears this stale pin.
-          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO");
+          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO", target);
           recordedAttempts++;
           lastError = errorText || String(result.status);
           comboErrors.push({
@@ -3278,7 +3306,7 @@ async function handleRoundRobinCombo({
             "COMBO-RR",
             `Skipping ${modelStr} — no credentials available or model excluded`
           );
-          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR");
+          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR", target);
           if (offset > 0) fallbackCount++;
           continue;
         }
@@ -3294,7 +3322,7 @@ async function handleRoundRobinCombo({
         )
       ) {
         log.info("COMBO-RR", `Skipping ${modelStr} — provider ${provider} in global cooldown`);
-        clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR");
+        clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR", target);
         if (offset > 0) fallbackCount++;
         continue;
       }
@@ -3307,7 +3335,7 @@ async function handleRoundRobinCombo({
       );
       if (exhaustedSkip) {
         log.info("COMBO-RR", exhaustedSkip);
-        clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR");
+        clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR", target);
         if (offset > 0) fallbackCount++;
         continue;
       }
@@ -3748,7 +3776,7 @@ async function handleRoundRobinCombo({
             exhaustedConnections.has(`${provider}:${targetWithConnection.connectionId}`) ||
             (provider && exhaustedProviders.has(provider))
           ) {
-            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR");
+            clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR", target);
           }
 
           // Transient errors → mark in semaphore so round-robin stops stampeding this target.
@@ -3805,7 +3833,7 @@ async function handleRoundRobinCombo({
           // LKGP (#919) mirror of handleComboChat's failure-path clear above — see
           // that comment for why this must happen (nothing else clears a pin left
           // by a request-scoped failure class like a stream-readiness timeout).
-          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR");
+          clearStaleLKGP(combo.name, target.executionKey, combo.id, log, "COMBO-RR", target);
           recordedAttempts++;
           lastError = errorText || String(result.status);
           lastStatus = result.status;
