@@ -231,13 +231,12 @@ export default function PassthroughModelRow({
           {/* #14337: the same 🪟 badge custom rows carry, so an override set here
               is visible after reload instead of being write-only. */}
           {typeof contextWindowOverride === "number" && !editingContext && (
-            <Badge
-              variant="secondary"
-              className="shrink-0 px-1.5 py-0 text-[10px]"
+            <span
+              className="shrink-0 rounded-full bg-orange-500/15 px-1.5 py-0.5 text-[10px] font-medium text-orange-400"
               title={t("contextWindowOverrideHint")}
             >
               {`🪟 ${contextWindowOverride.toLocaleString()}`}
-            </Badge>
+            </span>
           )}
           {editingContext && (
             <span className="flex items-center gap-1">
